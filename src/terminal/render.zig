@@ -3,6 +3,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const fastmem = @import("../fastmem.zig");
+const configpkg = @import("../config.zig");
 const color = @import("color.zig");
 const cursor = @import("cursor.zig");
 const highlight = @import("highlight.zig");
@@ -89,6 +90,9 @@ pub const RenderState = struct {
     /// The cached selection so we can avoid expensive selection calculations
     /// if possible.
     selection_cache: ?SelectionCache = null,
+
+    /// Sticky prompt data for rendering when sticky scroll is active.
+    sticky: ?StickyPrompt = null,
 
     /// Initial state.
     pub const empty: RenderState = .{
@@ -220,6 +224,18 @@ pub const RenderState = struct {
         /// The style data for the cell. This is undefined unless
         /// the style_id is non-default on raw.
         style: Style,
+    };
+
+    /// Sticky prompt data for the sticky scroll feature.
+    pub const StickyPrompt = struct {
+        /// The number of rows in the sticky prompt area.
+        rows: size.CellCountInt,
+
+        /// Position where sticky prompt should be rendered.
+        position: enum { top, bottom },
+
+        /// The starting y offset in the viewport where the sticky prompt begins.
+        viewport_y: size.CellCountInt,
     };
 
     // Dirty state
@@ -645,6 +661,57 @@ pub const RenderState = struct {
         // Clear our dirty flags
         t.flags.dirty = .{};
         s.dirty = .{};
+    }
+
+    /// Update the sticky scroll state. This should be called after update()
+    /// with the configuration values for sticky scroll.
+    ///
+    /// This requires access to the terminal to check viewport state and
+    /// find prompt lines.
+    pub fn updateStickyScroll(
+        self: *RenderState,
+        t: *Terminal,
+        position: configpkg.StickyScroll,
+        max_lines: usize,
+    ) void {
+        // Reset sticky state
+        self.sticky = null;
+
+        // If sticky scroll is disabled, nothing to do
+        if (position == .disabled) return;
+
+        // We need to be on the primary screen for sticky scroll
+        if (t.screens.active_key != .primary) return;
+
+        const s = t.screens.active;
+
+        // We need to be at the bottom of the scrollback for sticky scroll
+        if (!s.viewportIsBottom()) return;
+
+        // Find the last prompt in the viewport
+        const last_prompt_y = s.lastPromptViewportY(max_lines) orelse return;
+
+        // Count how many prompt lines we have
+        var prompt_lines: size.CellCountInt = 0;
+        const row_data = self.row_data.slice();
+        const row_raws = row_data.items(.raw);
+
+        // Count consecutive prompt lines from last_prompt_y going up
+        var y = last_prompt_y;
+        while (y >= 0) {
+            const row = row_raws[y];
+            if (row.semantic_prompt == .none) break;
+            prompt_lines += 1;
+            if (y == 0) break;
+            y -= 1;
+        }
+
+        // Set the sticky state
+        self.sticky = .{
+            .rows = prompt_lines,
+            .position = if (position == .top) .top else .bottom,
+            .viewport_y = last_prompt_y - prompt_lines + 1,
+        };
     }
 
     /// Update the highlights in the render state from the given flattened

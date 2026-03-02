@@ -44,6 +44,7 @@ pub const WindowPaddingColor = Config.WindowPaddingColor;
 pub const BackgroundImagePosition = Config.BackgroundImagePosition;
 pub const BackgroundImageFit = Config.BackgroundImageFit;
 pub const LinkPreviews = Config.LinkPreviews;
+pub const StickyScroll = Config.StickyScroll;
 
 // Alternate APIs
 pub const CApi = @import("config/CApi.zig");

@@ -31,6 +31,7 @@ const pagepkg = @import("page.zig");
 const style = @import("style.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
+const PageList = @import("PageList.zig");
 const Page = pagepkg.Page;
 const Cell = pagepkg.Cell;
 const Row = pagepkg.Row;
@@ -61,6 +62,9 @@ height_px: u32 = 0,
 
 /// The current scrolling region.
 scrolling_region: ScrollingRegion,
+
+/// State for sticky scroll feature.
+sticky_scroll: StickyScrollState = .{},
 
 /// The last reported pwd, if any.
 pwd: std.ArrayList(u8),
@@ -162,6 +166,23 @@ pub const Dirty = packed struct {
 
     /// Set when the pre-edit is modified.
     preedit: bool = false,
+};
+
+/// State for sticky scroll feature that keeps the last prompt visible
+/// at the top or bottom of the viewport.
+pub const StickyScrollState = struct {
+    /// The pin pointing to the start of the current/last prompt.
+    /// This is set when OSC 133 marks a new prompt.
+    prompt_start_pin: ?PageList.Pin = null,
+
+    /// Number of lines in the current prompt (for multi-line prompts).
+    prompt_line_count: usize = 0,
+
+    /// Whether sticky scroll is currently active (prompt is pinned).
+    active: bool = false,
+
+    /// Whether the sticky scroll state needs to be recalculated.
+    dirty: bool = true,
 };
 
 /// The event types that can be reported for mouse-related activities.

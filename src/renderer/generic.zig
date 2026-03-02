@@ -570,6 +570,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             blending: configpkg.Config.AlphaBlending,
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
+            sticky_scroll: configpkg.StickyScroll,
+            sticky_scroll_max_lines: usize,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -644,6 +646,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .blending = config.@"alpha-blending",
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
+                    .sticky_scroll = config.@"sticky-scroll",
+                    .sticky_scroll_max_lines = config.@"sticky-scroll-max-lines",
                     .arena = arena,
                 };
             }
@@ -1201,6 +1205,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update our terminal state
                 try self.terminal_state.update(self.alloc, state.terminal);
+
+                // Update sticky scroll state if enabled
+                self.terminal_state.updateStickyScroll(
+                    state.terminal,
+                    self.config.sticky_scroll,
+                    self.config.sticky_scroll_max_lines,
+                );
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -2403,6 +2414,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
+            // Handle sticky scroll - calculate offset for main content
+            const sticky = state.sticky;
+            const sticky_offset: terminal.size.CellCountInt = if (sticky) |s|
+                // If sticky position is top, offset main content by sticky rows
+                if (s.position == .top) s.rows else 0
+            else
+                0;
+
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2412,20 +2431,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 row_highlights[0..row_len],
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
+                const render_y: terminal.size.CellCountInt = y + sticky_offset;
 
                 if (!rebuild) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
                     if (!dirty.*) continue;
 
                     // Clear the cells if the row is dirty
-                    self.cells.clear(y);
+                    self.cells.clear(render_y);
                 }
 
                 // Unmark the dirty state in our render state.
                 dirty.* = false;
 
                 self.rebuildRow(
-                    y,
+                    render_y,
                     row,
                     cells,
                     preedit_range,
@@ -2438,8 +2458,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // our render state so just clear this row and keep
                     // trying to finish it out.
                     log.warn("error building row y={} err={}", .{ y, err });
-                    self.cells.clear(y);
+                    self.cells.clear(render_y);
                 };
+            }
+
+            // Render sticky prompt rows at fixed position
+            if (sticky) |s| {
+                const sticky_start_y = s.viewport_y;
+                for (0..s.rows) |i| {
+                    const row_idx: terminal.size.CellCountInt = @intCast(i);
+                    const src_y = sticky_start_y + row_idx;
+
+                    // Skip if we're out of bounds
+                    if (src_y >= state.rows) break;
+
+                    const dst_y = if (s.position == .top) row_idx else
+                        state.rows - s.rows + row_idx;
+
+                    const src_row = row_raws[src_y];
+                    const src_selection = row_selection[src_y];
+
+                    // Clear the destination row
+                    self.cells.clear(dst_y);
+
+                    // Get pointer to the cell array for this row
+                    const cells_temp = &row_cells[@intCast(src_y)];
+                    const cells_ptr: *std.MultiArrayList(terminal.RenderState.Cell) = @ptrCast(cells_temp);
+
+                    // Get pointer to the highlights for this row
+                    const highlights_temp = &row_highlights[@intCast(src_y)];
+                    const highlights_ptr: *const std.ArrayList(terminal.RenderState.Highlight) = @ptrCast(highlights_temp);
+
+                    // Render the sticky prompt row at fixed position
+                    self.rebuildRow(
+                        dst_y,
+                        src_row,
+                        cells_ptr,
+                        null, // No preedit for sticky rows
+                        src_selection,
+                        highlights_ptr,
+                        links,
+                    ) catch |err| {
+                        log.warn("error building sticky row y={} err={}", .{ dst_y, err });
+                        self.cells.clear(dst_y);
+                    };
+                }
             }
 
             // Setup our cursor rendering information.
@@ -2528,7 +2591,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        // Adjust cursor y for sticky scroll offset
+                        @intCast(cursor_vp.y + sticky_offset),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {

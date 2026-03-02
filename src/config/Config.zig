@@ -1403,6 +1403,29 @@ input: RepeatableReadableIO = .{},
 /// This only applies to macOS currently. GTK doesn't yet support scrollbars.
 scrollbar: Scrollbar = .system,
 
+/// Enable sticky scroll mode - keeps the last prompt visible at the top or
+/// bottom of the viewport while new output scrolls beneath it. This is similar
+/// to VS Code's terminal sticky scroll feature.
+///
+/// This requires shell integration (OSC 133 sequences) to be working. If
+/// shell integration is not detected, sticky scroll will not activate.
+///
+/// Valid values:
+///
+///   * `disabled` - Sticky scroll is disabled (default)
+///   * `top` - The last prompt is pinned to the top of the viewport
+///   * `bottom` - The last prompt is pinned to the bottom of the viewport
+///
+/// Available since: 1.3.0
+@"sticky-scroll": StickyScroll = .disabled,
+
+/// Maximum number of lines to show in the sticky prompt area. This is useful
+/// for multi-line prompts. If the prompt exceeds this limit, only the last
+/// N lines are shown.
+///
+/// Available since: 1.3.0
+@"sticky-scroll-max-lines": usize = 5,
+
 /// Match a regular expression against the terminal text and associate clicking
 /// it with an action. This can be used to match URLs, file paths, etc. Actions
 /// can be opening using the system opener (e.g. `open` or `xdg-open`) or
@@ -9972,6 +9995,13 @@ pub const WindowPadding = struct {
 pub const Scrollbar = enum {
     system,
     never,
+};
+
+/// See sticky-scroll
+pub const StickyScroll = enum {
+    disabled,
+    top,
+    bottom,
 };
 
 /// See scroll-to-bottom

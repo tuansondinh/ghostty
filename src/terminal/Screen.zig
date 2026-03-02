@@ -1299,6 +1299,51 @@ pub inline fn viewportIsBottom(self: Screen) bool {
     return self.pages.viewport == .active;
 }
 
+/// Returns the viewport y coordinate of the last row that contains a prompt,
+/// or null if no prompt is found in the viewport. This is used for sticky
+/// scroll to find the prompt that should be pinned.
+pub fn lastPromptViewportY(self: Screen, max_lines: usize) ?size.CellCountInt {
+    // We need semantic prompts to be seen for this to work
+    if (!self.semantic_prompt.seen) return null;
+
+    // Iterate through viewport rows from bottom to top
+    var row_it = self.pages.rowIterator(
+        .left_up,
+        .{ .viewport = .{} },
+        null,
+    );
+
+    var prompt_lines: usize = 0;
+    var last_prompt_y: ?size.CellCountInt = null;
+
+    // Convert from iterator position to viewport y
+    const viewport_rows = self.pages.rows;
+    var y: size.CellCountInt = viewport_rows - 1;
+
+    while (row_it.next()) |row_pin| {
+        const row = row_pin.rowAndCell().row;
+
+        // Check if this row has prompt content
+        if (row.semantic_prompt != .none) {
+            if (last_prompt_y == null) {
+                last_prompt_y = y;
+            }
+            prompt_lines += 1;
+
+            // If we've found enough lines, stop
+            if (prompt_lines >= max_lines) break;
+        } else if (last_prompt_y != null) {
+            // We found a non-prompt row after finding prompts, so we've
+            // found the complete prompt block
+            break;
+        }
+
+        if (y > 0) y -= 1 else break;
+    }
+
+    return last_prompt_y;
+}
+
 /// Erase the region specified by tl and br, inclusive. This will physically
 /// erase the rows meaning the memory will be reclaimed (if the underlying
 /// page is empty) and other rows will be shifted up.
