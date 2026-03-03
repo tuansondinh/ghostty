@@ -1299,12 +1299,33 @@ pub inline fn viewportIsBottom(self: Screen) bool {
     return self.pages.viewport == .active;
 }
 
-/// Returns the viewport y coordinate of the last row that contains a prompt,
-/// or null if no prompt is found in the viewport. This is used for sticky
-/// scroll to find the prompt that should be pinned.
-pub fn lastPromptViewportY(self: Screen, max_lines: usize) ?size.CellCountInt {
+/// Returns the viewport y coordinate of the previous prompt (not the current one),
+/// or null if no suitable prompt is found. This is used for sticky scroll to find
+/// the prompt that should be pinned - we want the PREVIOUS prompt, not the one
+/// the cursor is currently on.
+pub fn previousPromptViewportY(self: Screen, max_lines: usize) ?size.CellCountInt {
     // We need semantic prompts to be seen for this to work
     if (!self.semantic_prompt.seen) return null;
+
+    // Get cursor position in viewport coordinates
+    const cursor_viewport_y: ?size.CellCountInt = blk: {
+        var row_it = self.pages.rowIterator(
+            .right_down,
+            .{ .viewport = .{} },
+            null,
+        );
+        var y: size.CellCountInt = 0;
+        while (row_it.next()) |row_pin| {
+            if (row_pin.node == self.cursor.page_pin.node and
+                row_pin.y == self.cursor.page_pin.y)
+            {
+                break :blk y;
+            }
+            y += 1;
+            if (y >= self.pages.rows) break;
+        }
+        break :blk null;
+    };
 
     // Iterate through viewport rows from bottom to top
     var row_it = self.pages.rowIterator(
@@ -1315,6 +1336,7 @@ pub fn lastPromptViewportY(self: Screen, max_lines: usize) ?size.CellCountInt {
 
     var prompt_lines: usize = 0;
     var last_prompt_y: ?size.CellCountInt = null;
+    var skipped_cursor_prompt = false;
 
     // Convert from iterator position to viewport y
     const viewport_rows = self.pages.rows;
@@ -1325,13 +1347,30 @@ pub fn lastPromptViewportY(self: Screen, max_lines: usize) ?size.CellCountInt {
 
         // Check if this row has prompt content
         if (row.semantic_prompt != .none) {
-            if (last_prompt_y == null) {
-                last_prompt_y = y;
+            // Check if this is the cursor's prompt (skip it)
+            if (!skipped_cursor_prompt) {
+                if (cursor_viewport_y) |cy| {
+                    if (y == cy) {
+                        // This is the cursor's prompt, skip it
+                        skipped_cursor_prompt = true;
+                        if (y > 0) {
+                            y -= 1;
+                            continue;
+                        } else break;
+                    }
+                }
             }
-            prompt_lines += 1;
 
-            // If we've found enough lines, stop
-            if (prompt_lines >= max_lines) break;
+            // Only count prompts after we've skipped the cursor's prompt
+            if (skipped_cursor_prompt) {
+                if (last_prompt_y == null) {
+                    last_prompt_y = y;
+                }
+                prompt_lines += 1;
+
+                // If we've found enough lines, stop
+                if (prompt_lines >= max_lines) break;
+            }
         } else if (last_prompt_y != null) {
             // We found a non-prompt row after finding prompts, so we've
             // found the complete prompt block

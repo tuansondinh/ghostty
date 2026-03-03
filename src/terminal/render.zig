@@ -94,6 +94,9 @@ pub const RenderState = struct {
     /// Sticky prompt data for rendering when sticky scroll is active.
     sticky: ?StickyPrompt = null,
 
+    /// Input display overlay data, set when input-display is enabled.
+    input_display: ?InputDisplayData = null,
+
     /// Initial state.
     pub const empty: RenderState = .{
         .rows = 0,
@@ -236,6 +239,15 @@ pub const RenderState = struct {
 
         /// The starting y offset in the viewport where the sticky prompt begins.
         viewport_y: size.CellCountInt,
+    };
+
+    /// Input display data for the input display overlay feature.
+    pub const InputDisplayData = struct {
+        /// The text to display (slice into a caller-managed buffer).
+        text: []const u8,
+
+        /// Where to render the input display row.
+        position: enum { top, bottom },
     };
 
     // Dirty state
@@ -688,8 +700,8 @@ pub const RenderState = struct {
         // We need to be at the bottom of the scrollback for sticky scroll
         if (!s.viewportIsBottom()) return;
 
-        // Find the last prompt in the viewport
-        const last_prompt_y = s.lastPromptViewportY(max_lines) orelse return;
+        // Find the previous prompt in the viewport (not the current one)
+        const last_prompt_y = s.previousPromptViewportY(max_lines) orelse return;
 
         // Count how many prompt lines we have
         var prompt_lines: size.CellCountInt = 0;

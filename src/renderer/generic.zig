@@ -8,6 +8,7 @@ const font = @import("../font/main.zig");
 const inputpkg = @import("../input.zig");
 const os = @import("../os/main.zig");
 const terminal = @import("../terminal/main.zig");
+const unicode = @import("../unicode/main.zig");
 const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
@@ -572,6 +573,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             scroll_to_bottom_on_output: bool,
             sticky_scroll: configpkg.StickyScroll,
             sticky_scroll_max_lines: usize,
+            input_display: configpkg.InputDisplay,
+            input_display_max_chars: usize,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -648,6 +651,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .sticky_scroll = config.@"sticky-scroll",
                     .sticky_scroll_max_lines = config.@"sticky-scroll-max-lines",
+                    .input_display = config.@"input-display",
+                    .input_display_max_chars = config.@"input-display-max-chars",
                     .arena = arena,
                 };
             }
@@ -1161,6 +1166,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
+                input_display: ?terminal.RenderState.InputDisplayData,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
             };
@@ -1232,6 +1238,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :preedit try p.clone(arena_alloc);
                 };
 
+                const input_display: ?terminal.RenderState.InputDisplayData = input_display: {
+                    if (self.config.input_display == .disabled) break :input_display null;
+                    if (state.terminal.flags.password_input) break :input_display null;
+                    const text = trimInputDisplaySlice(
+                        state.input_display_buf,
+                        self.config.input_display_max_chars,
+                    );
+                    if (text.len == 0) break :input_display null;
+
+                    break :input_display .{
+                        .text = try arena_alloc.dupe(u8, text),
+                        .position = if (self.config.input_display == .top) .top else .bottom,
+                    };
+                };
+
                 // If we have Kitty graphics data, we enter a SLOW SLOW SLOW path.
                 // We only do this if the Kitty image state is dirty meaning only if
                 // it changes.
@@ -1285,6 +1306,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
+                    .input_display = input_display,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                 };
@@ -1372,6 +1394,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.draw_mutex.unlock();
 
                 // Build our GPU cells
+                self.terminal_state.input_display = critical.input_display;
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
@@ -2414,13 +2437,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
-            // Handle sticky scroll - calculate offset for main content
+            const input_display = state.input_display;
+
+            // Handle sticky scroll - calculate offset for main content.
             const sticky = state.sticky;
             const sticky_offset: terminal.size.CellCountInt = if (sticky) |s|
                 // If sticky position is top, offset main content by sticky rows
                 if (s.position == .top) s.rows else 0
             else
                 0;
+            const main_row_offset = sticky_offset;
 
             for (
                 0..,
@@ -2431,7 +2457,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 row_highlights[0..row_len],
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
-                const render_y: terminal.size.CellCountInt = y + sticky_offset;
+                const render_y: terminal.size.CellCountInt = y + main_row_offset;
+
+                // If this row is shifted outside our viewport, skip it.
+                if (render_y >= self.cells.size.rows) continue;
 
                 if (!rebuild) {
                     // Only rebuild if we are doing a full rebuild or this row is dirty.
@@ -2457,7 +2486,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // scenarios. In this case, we don't want to corrupt
                     // our render state so just clear this row and keep
                     // trying to finish it out.
-                    log.warn("error building row y={} err={}", .{ y, err });
+                    log.warn("error building row y={} err={}", .{ render_y, err });
                     self.cells.clear(render_y);
                 };
             }
@@ -2472,8 +2501,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Skip if we're out of bounds
                     if (src_y >= state.rows) break;
 
-                    const dst_y = if (s.position == .top) row_idx else
-                        state.rows - s.rows + row_idx;
+                    const dst_y = if (s.position == .top)
+                        row_idx
+                    else
+                        (state.rows -| s.rows) + row_idx;
+
+                    // Skip if destination is out of bounds.
+                    if (dst_y >= self.cells.size.rows) continue;
 
                     const src_row = row_raws[src_y];
                     const src_selection = row_selection[src_y];
@@ -2504,6 +2538,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
                 }
             }
+
+            // Render the input display row after primary and sticky rows.
+            // Track whether we actually rendered it so we can restore terminal
+            // content if the cursor forces us to suppress it.
+            var input_display_row_rendered = false;
+            const input_y_opt: ?terminal.size.CellCountInt = if (input_display) |overlay| blk: {
+                const input_y: terminal.size.CellCountInt = switch (overlay.position) {
+                    .top => 0,
+                    .bottom => state.rows -| 1,
+                };
+
+                // Suppress the overlay when the cursor is on the same row so
+                // the prompt and cursor remain visible (e.g. after `clear`).
+                const cursor_at_overlay = if (state.cursor.viewport) |vp|
+                    vp.y == input_y
+                else
+                    false;
+
+                if (!cursor_at_overlay) {
+                    self.rebuildInputDisplayRow(input_y, overlay) catch |err| {
+                        log.warn("error building input display row y={} err={}", .{ input_y, err });
+                        self.cells.clear(input_y);
+                    };
+                    input_display_row_rendered = true;
+                }
+
+                break :blk input_y;
+            } else null;
 
             // Setup our cursor rendering information.
             cursor: {
@@ -2591,8 +2653,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        // Adjust cursor y for sticky scroll offset
-                        @intCast(cursor_vp.y + sticky_offset),
+                        @intCast(cursor_vp.y),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -2641,6 +2702,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // If the overlay was suppressed (cursor on overlay row), ensure the
+            // GPU cell buffer at that row shows fresh terminal content. On
+            // partial-rebuild frames the main loop may have skipped this row
+            // leaving stale overlay data from a previous frame.
+            if (!input_display_row_rendered) {
+                if (input_y_opt) |input_y| {
+                    if (input_y < row_len) {
+                        const render_y = input_y + main_row_offset;
+                        if (render_y < self.cells.size.rows) {
+                            self.cells.clear(render_y);
+                            const cells_ptr: *std.MultiArrayList(terminal.RenderState.Cell) =
+                                @ptrCast(&row_cells[input_y]);
+                            const sel = row_selection[input_y];
+                            const hi_ptr: *const std.ArrayList(terminal.RenderState.Highlight) =
+                                @ptrCast(&row_highlights[input_y]);
+                            self.rebuildRow(
+                                render_y,
+                                row_raws[input_y],
+                                cells_ptr,
+                                preedit_range,
+                                sel,
+                                hi_ptr,
+                                links,
+                            ) catch {};
+                        }
+                    }
+                }
+            }
+
             // Setup our preedit text.
             if (preedit) |preedit_v| preedit: {
                 const range = preedit_range orelse break :preedit;
@@ -2669,6 +2759,112 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // log.debug("rebuildCells complete cached_runs={}", .{
             //     self.font_shaper_cache.count(),
             // });
+        }
+
+        fn trimInputDisplaySlice(text: []const u8, max_chars: usize) []const u8 {
+            if (max_chars == 0 or text.len == 0) return &.{};
+
+            var it: std.unicode.Utf8Iterator = .{ .bytes = text, .i = 0 };
+            var char_count: usize = 0;
+            while (it.nextCodepointSlice()) |_| char_count += 1;
+            if (char_count <= max_chars) return text;
+
+            const drop_chars = char_count - max_chars;
+            it = .{ .bytes = text, .i = 0 };
+            var start: usize = 0;
+            for (0..drop_chars) |_| {
+                const cp = it.nextCodepointSlice() orelse break;
+                start += cp.len;
+            }
+
+            return if (start < text.len) text[start..] else &.{};
+        }
+
+        fn rebuildInputDisplayRow(
+            self: *Self,
+            y: terminal.size.CellCountInt,
+            overlay: terminal.RenderState.InputDisplayData,
+        ) !void {
+            if (y >= self.cells.size.rows or self.cells.size.columns == 0) return;
+
+            const state = &self.terminal_state;
+            const cols: usize = self.cells.size.columns;
+
+            var cells: std.MultiArrayList(terminal.RenderState.Cell) = .empty;
+            defer cells.deinit(self.alloc);
+            try cells.resize(self.alloc, cols);
+
+            const cells_slice = cells.slice();
+            const cells_raw = cells_slice.items(.raw);
+            const cells_style = cells_slice.items(.style);
+            const cells_grapheme = cells_slice.items(.grapheme);
+
+            // A distinct background: blend bg toward fg for contrast.
+            const bg = state.colors.background;
+            const fg = state.colors.foreground;
+            const overlay_bg: terminal.color.RGB = .{
+                .r = @intCast((@as(u16, bg.r) * 7 + @as(u16, fg.r) * 3) / 10),
+                .g = @intCast((@as(u16, bg.g) * 7 + @as(u16, fg.g) * 3) / 10),
+                .b = @intCast((@as(u16, bg.b) * 7 + @as(u16, fg.b) * 3) / 10),
+            };
+            // Brighter foreground: clamp-brighten each channel toward 255.
+            const overlay_fg: terminal.color.RGB = .{
+                .r = @intCast(@min(255, @as(u16, fg.r) + 60)),
+                .g = @intCast(@min(255, @as(u16, fg.g) + 60)),
+                .b = @intCast(@min(255, @as(u16, fg.b) + 60)),
+            };
+            const overlay_style: terminal.Style = .{
+                .bg_color = .{ .rgb = overlay_bg },
+                .fg_color = .{ .rgb = overlay_fg },
+                .flags = .{ .bold = true },
+            };
+
+            for (0..cols) |x| {
+                cells_raw[x] = terminal.page.Cell.init(0);
+                cells_raw[x].style_id = 1;
+                cells_style[x] = overlay_style;
+                cells_grapheme[x] = &.{};
+            }
+
+            // Copy UTF-8 text into synthetic cells.
+            const utf8 = std.unicode.Utf8View.init(overlay.text) catch return;
+            var utf8_it = utf8.iterator();
+            var x: usize = 0;
+            while (utf8_it.nextCodepoint()) |cp| {
+                if (x >= cols) break;
+
+                const width: usize = if (cp <= 0xFF) 1 else @intCast(unicode.table.get(cp).width);
+                if (width == 0) continue;
+
+                cells_raw[x] = terminal.page.Cell.init(@intCast(cp));
+                cells_raw[x].style_id = 1;
+
+                if (width >= 2 and x + 1 < cols) {
+                    cells_raw[x].wide = .wide;
+                    cells_raw[x + 1] = terminal.page.Cell.init(0);
+                    cells_raw[x + 1].wide = .spacer_tail;
+                    cells_raw[x + 1].style_id = 1;
+                    x += 2;
+                } else {
+                    x += 1;
+                }
+            }
+
+            const row: terminal.page.Row = @bitCast(@as(u64, 0));
+            var highlights: std.ArrayList(terminal.RenderState.Highlight) = .empty;
+            defer highlights.deinit(self.alloc);
+            const links: terminal.RenderState.CellSet = .empty;
+
+            self.cells.clear(y);
+            try self.rebuildRow(
+                y,
+                row,
+                &cells,
+                null,
+                null,
+                &highlights,
+                &links,
+            );
         }
 
         fn rebuildRow(

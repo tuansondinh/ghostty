@@ -26,6 +26,11 @@ inspector: ?*Inspector = null,
 /// a future exercise.
 preedit: ?Preedit = null,
 
+/// Typed UTF-8 text for the input display overlay.
+///
+/// The memory is surface-managed and must only be read while `mutex` is held.
+input_display_buf: []const u8 = &.{},
+
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.
 mouse: Mouse = .{},

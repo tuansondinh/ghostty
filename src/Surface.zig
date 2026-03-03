@@ -284,6 +284,18 @@ pub const Keyboard = struct {
     /// a combination to be handled by different bindings before the release
     /// of the prior (namely since you can't bind modifier-only).
     last_trigger: ?u64 = null,
+
+    /// Buffer of recently typed characters for input display overlay.
+    input_display_buf: std.ArrayList(u8) = .empty,
+
+    /// When true, the next printable keystroke should clear the buffer before
+    /// appending. This lets Enter/ctrl+c keep the last command visible until
+    /// the user starts typing the next one.
+    input_display_pending_clear: bool = false,
+
+    /// Tracks which screen was active last time we synced, so we can detect
+    /// alternate→primary transitions and clear the display buffer.
+    input_display_last_screen: @import("terminal/ScreenSet.zig").Key = .primary,
 };
 
 /// The configuration that a surface has, this is copied from the main
@@ -336,6 +348,8 @@ const DerivedConfig = struct {
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
+    input_display: configpkg.InputDisplay,
+    input_display_max_chars: usize,
 
     const Link = struct {
         regex: oni.Regex,
@@ -414,6 +428,8 @@ const DerivedConfig = struct {
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
             .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
             .key_remaps = try config.@"key-remap".clone(alloc),
+            .input_display = config.@"input-display",
+            .input_display_max_chars = config.@"input-display-max-chars",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -806,6 +822,7 @@ pub fn deinit(self: *Surface) void {
     for (self.keyboard.sequence_queued.items) |req| req.deinit();
     self.keyboard.sequence_queued.deinit(self.alloc);
     self.keyboard.table_stack.deinit(self.alloc);
+    self.keyboard.input_display_buf.deinit(self.alloc);
 
     // Clean up our font grid
     self.app.font_grid_set.deref(self.font_grid_key);
@@ -1713,6 +1730,18 @@ pub fn updateConfig(
     };
     self.config.deinit();
     self.config = derived;
+
+    {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+
+        if (self.config.input_display == .disabled) {
+            self.keyboard.input_display_buf.clearRetainingCapacity();
+        } else {
+            self.trimInputDisplayBufferToMaxChars();
+        }
+        self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
+    }
 
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
@@ -2653,6 +2682,10 @@ pub fn keyCallback(
         if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
     }
 
+    if (event.action == .press or event.action == .repeat) {
+        try self.updateInputDisplayBuffer(event);
+    }
+
     // If this input event has text, then we hide the mouse if configured.
     // We only do this on pressed events to avoid hiding the mouse when we
     // change focus due to a keybinding (i.e. switching tabs).
@@ -2787,6 +2820,122 @@ pub fn keyCallback(
     }
 
     return .consumed;
+}
+
+fn updateInputDisplayBuffer(self: *Surface, event: input.KeyEvent) !void {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    // If disabled, keep state empty.
+    if (self.config.input_display == .disabled) {
+        if (self.keyboard.input_display_buf.items.len != 0) {
+            self.keyboard.input_display_buf.clearRetainingCapacity();
+        }
+        self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
+        return;
+    }
+
+    // Detect alternate→primary screen transition and mark buffer for clear.
+    // This ensures the last CLI command doesn't linger as an overlay when
+    // returning to the normal shell.
+    const current_screen = self.renderer_state.terminal.screens.active_key;
+    if (self.keyboard.input_display_last_screen == .alternate and
+        current_screen == .primary)
+    {
+        self.keyboard.input_display_pending_clear = true;
+    }
+    self.keyboard.input_display_last_screen = current_screen;
+
+    // Backspace pops one UTF-8 codepoint from the local buffer.
+    if (event.key == .backspace) {
+        if (self.keyboard.input_display_pending_clear) {
+            self.keyboard.input_display_buf.clearRetainingCapacity();
+            self.keyboard.input_display_pending_clear = false;
+        } else {
+            self.popInputDisplayCodepoint();
+        }
+        self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
+        return;
+    }
+
+    // On Enter/ctrl+c/ctrl+d, mark for clear but keep the buffer visible
+    // so the last command stays shown until the user starts typing again.
+    if (event.key == .enter or
+        (event.mods.ctrl and (event.key == .key_c or event.key == .key_d)))
+    {
+        self.keyboard.input_display_pending_clear = true;
+        self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
+        return;
+    }
+
+    if (!isPrintableUtf8(event.utf8)) {
+        self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
+        return;
+    }
+
+    // Clear the buffer now that the user is typing something new.
+    if (self.keyboard.input_display_pending_clear) {
+        self.keyboard.input_display_buf.clearRetainingCapacity();
+        self.keyboard.input_display_pending_clear = false;
+    }
+
+    try self.keyboard.input_display_buf.appendSlice(self.alloc, event.utf8);
+    self.trimInputDisplayBufferToMaxChars();
+    self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
+}
+
+fn popInputDisplayCodepoint(self: *Surface) void {
+    const buf = self.keyboard.input_display_buf.items;
+    if (buf.len == 0) return;
+
+    var i: usize = buf.len - 1;
+    while (i > 0 and (buf[i] & 0b1100_0000) == 0b1000_0000) : (i -= 1) {}
+    self.keyboard.input_display_buf.shrinkRetainingCapacity(i);
+}
+
+fn trimInputDisplayBufferToMaxChars(self: *Surface) void {
+    const max_chars = self.config.input_display_max_chars;
+    if (max_chars == 0) {
+        self.keyboard.input_display_buf.clearRetainingCapacity();
+        return;
+    }
+
+    const current = self.keyboard.input_display_buf.items;
+    var it: std.unicode.Utf8Iterator = .{ .bytes = current, .i = 0 };
+    var char_count: usize = 0;
+    while (it.nextCodepointSlice()) |_| char_count += 1;
+    if (char_count <= max_chars) return;
+
+    const drop_chars = char_count - max_chars;
+    it = .{ .bytes = current, .i = 0 };
+    var drop_bytes: usize = 0;
+    for (0..drop_chars) |_| {
+        const cp = it.nextCodepointSlice() orelse break;
+        drop_bytes += cp.len;
+    }
+
+    if (drop_bytes == 0 or drop_bytes >= current.len) {
+        self.keyboard.input_display_buf.clearRetainingCapacity();
+        return;
+    }
+
+    std.mem.copyForwards(
+        u8,
+        self.keyboard.input_display_buf.items[0 .. current.len - drop_bytes],
+        self.keyboard.input_display_buf.items[drop_bytes..],
+    );
+    self.keyboard.input_display_buf.shrinkRetainingCapacity(current.len - drop_bytes);
+}
+
+fn isPrintableUtf8(s: []const u8) bool {
+    if (s.len == 0) return false;
+
+    var it: std.unicode.Utf8Iterator = .{ .bytes = s, .i = 0 };
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x20 or (cp >= 0x7F and cp <= 0x9F)) return false;
+    }
+
+    return true;
 }
 
 /// Maybe handles a binding for a given event and if so returns the effect.

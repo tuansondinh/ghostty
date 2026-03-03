@@ -1426,6 +1426,24 @@ scrollbar: Scrollbar = .system,
 /// Available since: 1.3.0
 @"sticky-scroll-max-lines": usize = 5,
 
+/// Display typed input at the top or bottom of the terminal viewport.
+/// This works even inside full-screen CLI applications since it is
+/// rendered by Ghostty directly.
+///
+/// Valid values:
+///
+///   * `disabled` - Input display is disabled (default)
+///   * `top` - Typed input is shown at the top of the viewport
+///   * `bottom` - Typed input is shown at the bottom of the viewport
+///
+/// Available since: 1.3.0
+@"input-display": InputDisplay = .disabled,
+
+/// Maximum number of characters to show in the input display row.
+///
+/// Available since: 1.3.0
+@"input-display-max-chars": usize = 120,
+
 /// Match a regular expression against the terminal text and associate clicking
 /// it with an action. This can be used to match URLs, file paths, etc. Actions
 /// can be opening using the system opener (e.g. `open` or `xdg-open`) or
@@ -9999,6 +10017,13 @@ pub const Scrollbar = enum {
 
 /// See sticky-scroll
 pub const StickyScroll = enum {
+    disabled,
+    top,
+    bottom,
+};
+
+/// See input-display
+pub const InputDisplay = enum {
     disabled,
     top,
     bottom,
