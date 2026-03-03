@@ -2446,7 +2446,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (s.position == .top) s.rows else 0
             else
                 0;
-            const main_row_offset = sticky_offset;
+            const main_row_offset: terminal.size.CellCountInt = sticky_offset;
 
             for (
                 0..,
