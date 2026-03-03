@@ -2860,10 +2860,16 @@ fn updateInputDisplayBuffer(self: *Surface, event: input.KeyEvent) !void {
 
     // On Enter/ctrl+c/ctrl+d, mark for clear but keep the buffer visible
     // so the last command stays shown until the user starts typing again.
+    // Only do this if there's actual content - empty Enter (e.g., permission approval)
+    // should not clear the display.
     if (event.key == .enter or
         (event.mods.ctrl and (event.key == .key_c or event.key == .key_d)))
     {
-        self.keyboard.input_display_pending_clear = true;
+        // Only mark for clear if there's actual content typed
+        // Empty Enter (e.g., permission approval) keeps showing previous content
+        if (self.keyboard.input_display_buf.items.len > 0) {
+            self.keyboard.input_display_pending_clear = true;
+        }
         self.renderer_state.input_display_buf = self.keyboard.input_display_buf.items;
         return;
     }
