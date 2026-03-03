@@ -2448,6 +2448,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 0;
             const main_row_offset: terminal.size.CellCountInt = sticky_offset;
 
+            // Calculate the range of viewport rows that sticky scroll is displaying
+            // so we can skip them in the main content
+            const sticky_range: ?struct { start: terminal.size.CellCountInt, end: terminal.size.CellCountInt } = if (sticky) |s|
+                .{ .start = s.viewport_y, .end = s.viewport_y + s.rows }
+            else
+                null;
+
             for (
                 0..,
                 row_raws[0..row_len],
@@ -2457,6 +2464,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 row_highlights[0..row_len],
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
+
+                // Skip rows that are being rendered as sticky content
+                if (sticky_range) |sr| {
+                    if (y >= sr.start and y < sr.end) continue;
+                }
+
                 const render_y: terminal.size.CellCountInt = y + main_row_offset;
 
                 // If this row is shifted outside our viewport, skip it.
@@ -2708,7 +2721,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // leaving stale overlay data from a previous frame.
             if (!input_display_row_rendered) {
                 if (input_y_opt) |input_y| {
-                    if (input_y < row_len) {
+                    // Skip restoration if this row is in the sticky range,
+                    // as it's rendered separately by the sticky renderer.
+                    const input_y_in_sticky_range = if (sticky_range) |sr|
+                        input_y >= sr.start and input_y < sr.end
+                    else
+                        false;
+
+                    if (!input_y_in_sticky_range and input_y < row_len) {
                         const render_y = input_y + main_row_offset;
                         if (render_y < self.cells.size.rows) {
                             self.cells.clear(render_y);

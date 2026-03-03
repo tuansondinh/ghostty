@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "opencode-glm-4.7": {
+      "command": "/Users/sonwork/.opencode/bin/opencode",
+      "args": ["mcp", "-m", "zai/glm-4.7"]
+    },
+    "opencode-glm-5": {
+      "command": "/Users/sonwork/.opencode/bin/opencode",
+      "args": ["mcp", "-m", "zai/glm-5"]
+    }
+  }
+}
