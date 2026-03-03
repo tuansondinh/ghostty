@@ -2331,6 +2331,67 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp_offset: usize,
         };
 
+        fn isStickyViewportRow(
+            sticky: ?terminal.RenderState.StickyPrompt,
+            y: terminal.size.CellCountInt,
+        ) bool {
+            const s = sticky orelse return false;
+            return y >= s.viewport_y and y < s.viewport_y + s.rows;
+        }
+
+        fn viewportRowToScreenRow(
+            sticky: ?terminal.RenderState.StickyPrompt,
+            viewport_rows: terminal.size.CellCountInt,
+            viewport_y: terminal.size.CellCountInt,
+        ) ?terminal.size.CellCountInt {
+            if (viewport_y >= viewport_rows) return null;
+            const s = sticky orelse return viewport_y;
+            const sticky_start = s.viewport_y;
+            const sticky_end = sticky_start + s.rows;
+
+            if (viewport_y >= sticky_start and viewport_y < sticky_end) {
+                return switch (s.position) {
+                    .top => viewport_y - sticky_start,
+                    .bottom => (viewport_rows -| s.rows) + (viewport_y - sticky_start),
+                };
+            }
+
+            return switch (s.position) {
+                .top => if (viewport_y < sticky_start)
+                    viewport_y + s.rows
+                else
+                    viewport_y,
+                .bottom => if (viewport_y < sticky_start)
+                    viewport_y
+                else
+                    viewport_y - s.rows,
+            };
+        }
+
+        fn screenRowToMainViewportRow(
+            sticky: ?terminal.RenderState.StickyPrompt,
+            viewport_rows: terminal.size.CellCountInt,
+            screen_y: terminal.size.CellCountInt,
+        ) ?terminal.size.CellCountInt {
+            if (screen_y >= viewport_rows) return null;
+            const s = sticky orelse return screen_y;
+
+            switch (s.position) {
+                .top => {
+                    if (screen_y < s.rows) return null;
+                    if (screen_y < s.rows + s.viewport_y) return screen_y - s.rows;
+                    return screen_y;
+                },
+
+                .bottom => {
+                    const sticky_start = viewport_rows -| s.rows;
+                    if (screen_y >= sticky_start) return null;
+                    if (screen_y < s.viewport_y) return screen_y;
+                    return screen_y + s.rows;
+                },
+            }
+        }
+
         /// Convert the terminal state to GPU cells stored in CPU memory. These
         /// are then synced to the GPU in the next frame. This only updates CPU
         /// memory and doesn't touch the GPU.
@@ -2412,6 +2473,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cells.size.rows,
             );
 
+            // Handle sticky scroll - calculate offset for main content.
+            const sticky = state.sticky;
+            const input_display = state.input_display;
+
             // Determine our x/y range for preedit. We don't want to render anything
             // here because we will render the preedit separately.
             const preedit_range: ?PreeditRange = if (preedit) |preedit_v| preedit: {
@@ -2420,6 +2485,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // don't show it.
                 const cursor_vp = state.cursor.viewport orelse
                     break :preedit null;
+                const cursor_screen_y = viewportRowToScreenRow(
+                    sticky,
+                    state.rows,
+                    @intCast(cursor_vp.y),
+                ) orelse break :preedit null;
 
                 // If our preedit row isn't dirty then we don't need the
                 // preedit range. This also avoids an issue later where we
@@ -2431,29 +2501,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.cols - 1,
                 );
                 break :preedit .{
-                    .y = @intCast(cursor_vp.y),
+                    .y = cursor_screen_y,
                     .x = .{ range.start, range.end },
                     .cp_offset = range.cp_offset,
                 };
             } else null;
-
-            const input_display = state.input_display;
-
-            // Handle sticky scroll - calculate offset for main content.
-            const sticky = state.sticky;
-            const sticky_offset: terminal.size.CellCountInt = if (sticky) |s|
-                // If sticky position is top, offset main content by sticky rows
-                if (s.position == .top) s.rows else 0
-            else
-                0;
-            const main_row_offset: terminal.size.CellCountInt = sticky_offset;
-
-            // Calculate the range of viewport rows that sticky scroll is displaying
-            // so we can skip them in the main content
-            const sticky_range: ?struct { start: terminal.size.CellCountInt, end: terminal.size.CellCountInt } = if (sticky) |s|
-                .{ .start = s.viewport_y, .end = s.viewport_y + s.rows }
-            else
-                null;
 
             for (
                 0..,
@@ -2466,11 +2518,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
 
                 // Skip rows that are being rendered as sticky content
-                if (sticky_range) |sr| {
-                    if (y >= sr.start and y < sr.end) continue;
-                }
+                if (isStickyViewportRow(sticky, y)) continue;
 
-                const render_y: terminal.size.CellCountInt = y + main_row_offset;
+                const render_y = viewportRowToScreenRow(sticky, state.rows, y) orelse continue;
 
                 // If this row is shifted outside our viewport, skip it.
                 if (render_y >= self.cells.size.rows) continue;
@@ -2514,10 +2564,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Skip if we're out of bounds
                     if (src_y >= state.rows) break;
 
-                    const dst_y = if (s.position == .top)
-                        row_idx
-                    else
-                        (state.rows -| s.rows) + row_idx;
+                    const dst_y = viewportRowToScreenRow(sticky, state.rows, src_y) orelse continue;
 
                     // Skip if destination is out of bounds.
                     if (dst_y >= self.cells.size.rows) continue;
@@ -2564,10 +2611,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Suppress the overlay when the cursor is on the same row so
                 // the prompt and cursor remain visible (e.g. after `clear`).
-                const cursor_at_overlay = if (state.cursor.viewport) |vp|
-                    vp.y == input_y
-                else
-                    false;
+                const cursor_at_overlay = if (state.cursor.viewport) |vp| cursor_blk: {
+                    const cursor_screen_y = viewportRowToScreenRow(
+                        sticky,
+                        state.rows,
+                        @intCast(vp.y),
+                    ) orelse break :cursor_blk false;
+                    break :cursor_blk cursor_screen_y == input_y;
+                } else false;
 
                 if (!cursor_at_overlay) {
                     self.rebuildInputDisplayRow(input_y, overlay) catch |err| {
@@ -2593,6 +2644,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // a cursor. Otherwise, get our cursor cell, because we may
                 // need it for styling.
                 const cursor_vp = state.cursor.viewport orelse break :cursor;
+                const cursor_screen_y = viewportRowToScreenRow(
+                    sticky,
+                    state.rows,
+                    @intCast(cursor_vp.y),
+                ) orelse break :cursor;
                 const cursor_style: terminal.Style = cursor_style: {
                     const cells = state.row_data.items(.cells);
                     const cell = cells[cursor_vp.y].get(cursor_vp.x);
@@ -2650,6 +2706,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 self.addCursor(
                     &state.cursor,
+                    cursor_screen_y,
                     style,
                     cursor_color,
                 );
@@ -2666,7 +2723,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
                         },
-                        @intCast(cursor_vp.y),
+                        @intCast(cursor_screen_y),
                     };
 
                     self.uniforms.bools.cursor_wide = switch (wide) {
@@ -2721,25 +2778,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // leaving stale overlay data from a previous frame.
             if (!input_display_row_rendered) {
                 if (input_y_opt) |input_y| {
-                    // Skip restoration if this row is in the sticky range,
-                    // as it's rendered separately by the sticky renderer.
-                    const input_y_in_sticky_range = if (sticky_range) |sr|
-                        input_y >= sr.start and input_y < sr.end
-                    else
-                        false;
-
-                    if (!input_y_in_sticky_range and input_y < row_len) {
-                        const render_y = input_y + main_row_offset;
-                        if (render_y < self.cells.size.rows) {
-                            self.cells.clear(render_y);
+                    if (screenRowToMainViewportRow(
+                        sticky,
+                        state.rows,
+                        input_y,
+                    )) |input_vp_y| {
+                        if (input_vp_y < row_len and input_y < self.cells.size.rows) {
+                            self.cells.clear(input_y);
                             const cells_ptr: *std.MultiArrayList(terminal.RenderState.Cell) =
-                                @ptrCast(&row_cells[input_y]);
-                            const sel = row_selection[input_y];
+                                @ptrCast(&row_cells[input_vp_y]);
+                            const sel = row_selection[input_vp_y];
                             const hi_ptr: *const std.ArrayList(terminal.RenderState.Highlight) =
-                                @ptrCast(&row_highlights[input_y]);
+                                @ptrCast(&row_highlights[input_vp_y]);
                             self.rebuildRow(
-                                render_y,
-                                row_raws[input_y],
+                                input_y,
+                                row_raws[input_vp_y],
                                 cells_ptr,
                                 preedit_range,
                                 sel,
@@ -2945,7 +2998,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // visible on this viewport.
                 .cursor_x = cursor_x: {
                     const vp = state.cursor.viewport orelse break :cursor_x null;
-                    if (vp.y != y) break :cursor_x null;
+                    const cursor_screen_y = viewportRowToScreenRow(
+                        state.sticky,
+                        state.rows,
+                        @intCast(vp.y),
+                    ) orelse break :cursor_x null;
+                    if (cursor_screen_y != y) break :cursor_x null;
                     break :cursor_x vp.x;
                 },
             };
@@ -3504,6 +3562,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         fn addCursor(
             self: *Self,
             cursor_state: *const terminal.RenderState.Cursor,
+            y: terminal.size.CellCountInt,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
         ) void {
@@ -3579,7 +3638,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ x, cursor_vp.y },
+                .grid_pos = .{ x, y },
                 .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
